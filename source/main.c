@@ -52,12 +52,11 @@ int main(int argc, char** argv) {
     int selected_index = 0;
     int loaded_index = -1;
     long active_rate = 44100;
-    FILE *current_file = NULL;
     long current_filesize = 0;
     
-    // Stable duration tracking variables
     long cached_total_sec = 0;
     int duration_locked = 0;
+    uint64_t total_samples_decoded = 0; // Deterministic playback counter
 
     char status_msg[64] = "D-Pad: Navigate | A: Play/Pause";
     mpg123_handle *mh = NULL;
@@ -104,13 +103,19 @@ int main(int argc, char** argv) {
                         mpg123_delete(mh);
                         mh = NULL;
                     }
-                    if (current_file != NULL) {
-                        fclose(current_file);
-                        current_file = NULL;
-                    }
+
                     current_filesize = 0;
                     cached_total_sec = 0;
                     duration_locked = 0;
+                    total_samples_decoded = 0;
+
+                    FILE *sz_file = fopen(filepath, "rb");
+                    if (sz_file) {
+                        fseek(sz_file, 0, SEEK_END);
+                        current_filesize = ftell(sz_file);
+                        fclose(sz_file);
+                    }
+                    cached_total_sec = (current_filesize > 0) ? (current_filesize / 16000) : 0;
 
                     ndspChnReset(0);
                     ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
@@ -122,61 +127,42 @@ int main(int argc, char** argv) {
                     mix[1] = 1.0f;
                     ndspChnSetMix(0, mix);
 
-                    current_file = fopen(filepath, "rb");
-                    if (current_file != NULL) {
-                        fseek(current_file, 0, SEEK_END);
-                        current_filesize = ftell(current_file);
-                        fseek(current_file, 0, SEEK_SET);
-
-                        // Immediate fallback estimate (assume ~128kbps = 16KB/s) so we never show '--:--'
-                        cached_total_sec = (current_filesize > 0) ? (current_filesize / 16384) : 0;
-                        duration_locked = 0;
-
-                        mh = mpg123_new(NULL, &err);
-                        if (mh != NULL) {
-                            mpg123_format_none(mh);
-                            mpg123_format(mh, 44100, MPG123_STEREO, MPG123_ENC_SIGNED_16);
+                    mh = mpg123_new(NULL, &err);
+                    if (mh != NULL) {
+                        mpg123_format_none(mh);
+                        mpg123_format(mh, 44100, MPG123_STEREO, MPG123_ENC_SIGNED_16);
+                        
+                        if (mpg123_open(mh, filepath) == MPG123_OK) {
+                            long rate = 44100;
+                            int channels = 2;
+                            int encoding = 0;
                             
-                            if (mpg123_open_fd(mh, fileno(current_file)) == MPG123_OK) {
-                                long rate = 44100;
-                                int channels = 2;
-                                int encoding = 0;
-                                
-                                mpg123_getformat(mh, &rate, &channels, &encoding);
-                                active_rate = rate;
-                                ndspChnSetRate(0, (float)active_rate);
+                            mpg123_getformat(mh, &rate, &channels, &encoding);
+                            active_rate = rate;
+                            ndspChnSetRate(0, (float)active_rate);
 
-                                off_t initial_len = mpg123_length(mh);
-                                if (initial_len > 0) {
-                                    cached_total_sec = initial_len / active_rate;
-                                    duration_locked = 1;
-                                }
-                                
-                                memset(waveBufs, 0, sizeof(waveBufs));
-                                loaded_index = selected_index;
-                                is_paused = 0;
-                                ndspChnSetPaused(0, false);
-                                snprintf(status_msg, sizeof(status_msg), "Playing: %s", episodes[selected_index]);
-                                is_playing = 1;
-                            } else {
-                                mpg123_delete(mh);
-                                mh = NULL;
-                                fclose(current_file);
-                                current_file = NULL;
-                                loaded_index = -1;
-                                snprintf(status_msg, sizeof(status_msg), "Stream open error");
-                                is_playing = 0;
+                            off_t initial_len = mpg123_length(mh);
+                            if (initial_len > 0 && initial_len != MPG123_ERR) {
+                                cached_total_sec = initial_len / active_rate;
+                                duration_locked = 1;
                             }
+                            
+                            memset(waveBufs, 0, sizeof(waveBufs));
+                            loaded_index = selected_index;
+                            is_paused = 0;
+                            ndspChnSetPaused(0, false);
+                            snprintf(status_msg, sizeof(status_msg), "Playing: %s", episodes[selected_index]);
+                            is_playing = 1;
                         } else {
-                            fclose(current_file);
-                            current_file = NULL;
+                            mpg123_delete(mh);
+                            mh = NULL;
                             loaded_index = -1;
-                            snprintf(status_msg, sizeof(status_msg), "Decoder alloc error");
+                            snprintf(status_msg, sizeof(status_msg), "Stream open error");
                             is_playing = 0;
                         }
                     } else {
                         loaded_index = -1;
-                        snprintf(status_msg, sizeof(status_msg), "File open error");
+                        snprintf(status_msg, sizeof(status_msg), "Decoder alloc error");
                         is_playing = 0;
                     }
                 }
@@ -190,6 +176,9 @@ int main(int argc, char** argv) {
                     int ret = mpg123_read(mh, (unsigned char *)audio_buffers[i], AUDIO_BUFFER_SIZE, &bytes_decoded);
                     
                     if (ret == MPG123_OK && bytes_decoded > 0) {
+                        // Increment sample counter: 16-bit stereo = 4 bytes per sample frame
+                        total_samples_decoded += (bytes_decoded / 4);
+
                         memset(&waveBufs[i], 0, sizeof(waveBufs[i]));
                         waveBufs[i].data_vaddr = audio_buffers[i];
                         waveBufs[i].nsamples   = bytes_decoded / 4;
@@ -210,48 +199,50 @@ int main(int argc, char** argv) {
 
         char progress_str[21];
         char time_str[32] = "00:00 / 00:00";
+        char pct_str[8] = "  0%";
         
-        if (mh != NULL && loaded_index != -1) {
-            off_t current_sample = mpg123_tell(mh);
+        if (mh != NULL && loaded_index != -1 && active_rate > 0) {
+            long current_sec = total_samples_decoded / active_rate;
             off_t byte_offset = mpg123_tell_stream(mh);
 
-            if (active_rate > 0 && current_sample >= 0) {
-                long current_sec = current_sample / active_rate;
-
-                // Refine duration using actual stream offset once we have consumed enough bytes
-                if (!duration_locked && current_filesize > 0 && byte_offset > 4096 && current_sec >= 1) {
-                    float progress = (float)byte_offset / (float)current_filesize;
-                    if (progress > 0.02f) {
-                        cached_total_sec = (long)((double)current_sec / progress);
-                        if (progress > 0.10f || current_sec >= 5) {
-                            duration_locked = 1;
-                        }
+            if (!duration_locked && current_filesize > 0 && byte_offset > 4096 && current_sec >= 1) {
+                float progress_est = (float)byte_offset / (float)current_filesize;
+                if (progress_est > 0.02f) {
+                    cached_total_sec = (long)((double)current_sec / progress_est);
+                    if (progress_est > 0.10f || current_sec >= 5) {
+                        duration_locked = 1;
                     }
                 }
-
-                int cur_min = current_sec / 60;
-                int cur_s   = current_sec % 60;
-                long total_sec = cached_total_sec > 0 ? cached_total_sec : current_sec;
-                int tot_min = total_sec / 60;
-                int tot_s   = total_sec % 60;
-
-                snprintf(time_str, sizeof(time_str), "%02d:%02d / %02d:%02d", cur_min, cur_s, tot_min, tot_s);
-
-                float progress = (current_filesize > 0 && byte_offset > 0) ? ((float)byte_offset / (float)current_filesize) : (cached_total_sec > 0 ? (float)current_sec / cached_total_sec : 0.0f);
-                if (progress > 1.0f) progress = 1.0f;
-                if (progress < 0.0f) progress = 0.0f;
-
-                int bar_width = 16;
-                int filled = (int)(progress * bar_width);
-                for (int j = 0; j < bar_width; j++) {
-                    if (j < filled) progress_str[j] = '=';
-                    else if (j == filled) progress_str[j] = '>';
-                    else progress_str[j] = ' ';
-                }
-                progress_str[bar_width] = '\0';
-            } else {
-                snprintf(progress_str, sizeof(progress_str), "                ");
             }
+
+            int cur_min = current_sec / 60;
+            int cur_s   = current_sec % 60;
+            long total_sec = cached_total_sec > 0 ? cached_total_sec : current_sec;
+            int tot_min = total_sec / 60;
+            int tot_s   = total_sec % 60;
+
+            snprintf(time_str, sizeof(time_str), "%02d:%02d / %02d:%02d", cur_min, cur_s, tot_min, tot_s);
+
+            float progress = 0.0f;
+            if (current_filesize > 0 && byte_offset > 0) {
+                progress = (float)byte_offset / (float)current_filesize;
+            } else if (cached_total_sec > 0) {
+                progress = (float)current_sec / (float)cached_total_sec;
+            }
+            if (progress > 1.0f) progress = 1.0f;
+            if (progress < 0.0f) progress = 0.0f;
+
+            int pct_val = (int)(progress * 100.0f);
+            snprintf(pct_str, sizeof(pct_str), "%3d%%", pct_val);
+
+            int bar_width = 16;
+            int filled = (int)(progress * bar_width);
+            for (int j = 0; j < bar_width; j++) {
+                if (j < filled) progress_str[j] = '=';
+                else if (j == filled) progress_str[j] = '>';
+                else progress_str[j] = ' ';
+            }
+            progress_str[bar_width] = '\0';
         } else {
             snprintf(progress_str, sizeof(progress_str), "                ");
         }
@@ -273,7 +264,7 @@ int main(int argc, char** argv) {
         
         printf("\n-------------------------------------\n");
         printf("Status: %s                \n", status_msg);
-        printf("Prog: [%s] %s   \n", progress_str, time_str);
+        printf("Prog: [%s] %s %s\n", progress_str, pct_str, time_str);
         printf("Press START to exit.                ");
 
         gfxFlushBuffers();
@@ -284,9 +275,6 @@ int main(int argc, char** argv) {
     if (mh != NULL) {
         mpg123_close(mh);
         mpg123_delete(mh);
-    }
-    if (current_file != NULL) {
-        fclose(current_file);
     }
     mpg123_exit();
     for (int i = 0; i < NUM_BUFFERS; i++) {
