@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadatas>
+    <metadata>
+        <name>PodMon</name>
+        <long_description>An offline podcast application and game for the Nintendo 3DS.</long_description>
+        <publisher>Chris Infante</publisher>
+        <version>1.0.0</version>
+    </metadata>
+</metadatas>
